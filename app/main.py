@@ -1117,6 +1117,41 @@ def _default_range() -> tuple[str, str]:
     return month_bounds(current_month())
 
 
+@app.get("/analytics/departments/summary")
+def department_summary(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: str | None = Query(default=None),
+):
+    results = employees.aggregate(
+        department_summary_pipeline(month, department),
+        hint="ix_employees_joined_on",
+        allowDiskUse=True,
+    )
+
+    items = []
+    for result in results:
+        present_days = round_half_up(result["present_days"], 2)
+        items.append({
+            "department": result["department"],
+            "headcount": int(result["headcount"]),
+            "present_days": present_days,
+            "avg_work_hours": (
+                round_half_up(
+                    Decimal(str(result["work_hours_sum"])) / int(result["work_hours_count"]),
+                    2,
+                )
+                if result["work_hours_count"]
+                else None
+            ),
+            "late_count": int(result["late_count"]),
+            "total_late_minutes": int(result["total_late_minutes"]),
+            "leave_count": int(result["leave_count"]),
+            "on_duty_count": int(result["on_duty_count"]),
+        })
+
+    return {"month": month, "items": items}
+
+
 @app.get("/analytics/departments/{department}/trend")
 def department_trend(
     department: str,
@@ -1507,42 +1542,6 @@ def punch_in(body: PunchInIn):
         raise HTTPException(status_code=409, detail="Already punched in for this attendance date")
 
     return attendance_out(record)
-
-@app.get("/analytics/departments/summary")
-def department_summary(
-    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
-    department: str | None = Query(default=None),
-):
-    items = []
-    results = employees.aggregate(
-        department_summary_pipeline(month, department),
-        hint="ix_employees_joined_on",
-        allowDiskUse=True,
-    )
-
-    for result in results:
-        present_days = round_half_up(result["present_days"], 2)
-        items.append({
-            "department": result["department"],
-            "headcount": int(result["headcount"]),
-            "present_days": present_days,
-            "avg_work_hours": (
-                round_half_up(
-                    Decimal(str(result["work_hours_sum"]))
-                    / int(result["work_hours_count"]),
-                    2,
-                )
-                if result["work_hours_count"]
-                else None
-            ),
-            "late_count": int(result["late_count"]),
-            "total_late_minutes": int(result["total_late_minutes"]),
-            "leave_count": int(result["leave_count"]),
-            "on_duty_count": int(result["on_duty_count"]),
-        })
-
-    return {"month": month, "items": items}
-
 
 @app.get("/attendance")
 def list_attendance(
