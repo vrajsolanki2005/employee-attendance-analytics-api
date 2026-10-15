@@ -1,10 +1,12 @@
 import calendar
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Literal, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pymongo import ASCENDING, DESCENDING, MongoClient
@@ -17,6 +19,7 @@ EPOCH = datetime(1970, 1, 1)
 
 # Employees get a 10-minute grace window before they're marked late
 GRACE_SECONDS = 600
+ALLOWED_STATUSES = {"PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"}
 
 # Sanity bounds for epoch-millisecond timestamps (roughly year 1973 to 5138)
 MS_MIN, MS_MAX = 10**11, 10**14
@@ -111,6 +114,47 @@ def compute_late_minutes(punch_ist: datetime, attendance_date: str, shift_start:
 
 
 
+# Half-day threshold from business rule R5
+HALF_DAY_THRESHOLD = 4.50
+
+def _epoch_ms(value: int | None) -> int | None:
+    """Validate epoch milliseconds are in our sanity range."""
+    if value is None:
+        return None
+    if not (MS_MIN <= value <= MS_MAX):
+        raise ValueError("must be epoch milliseconds")
+    return value
+
+
+def now_utc_naive() -> int:
+    """Current time as epoch milliseconds (UTC naive)."""
+    return now_ms()
+
+
+def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
+    """Compute hours worked, rounded to 2 decimal places half-up (R4)."""
+    seconds = (punch_out - punch_in).total_seconds()
+    hours = seconds / 3600
+    return round_half_up(hours, 2)
+
+
+def compute_overtime_minutes(
+    punch_out: datetime,
+    attendance_date: str,
+    shift_start: str,
+    shift_end: str,
+) -> int:
+    """Compute overtime minutes (R3). Only counts when >= 30 minutes, otherwise 0."""
+    shift_end_ist = ist_on(attendance_date, shift_end)
+    overtime_seconds = (punch_out - shift_end_ist).total_seconds()
+
+    if overtime_seconds <= 0:
+        return 0
+
+    overtime_minutes = int(overtime_seconds // 60)
+    return overtime_minutes if overtime_minutes >= 30 else 0
+
+
 def attendance_out(doc: dict) -> dict:
     """Shape an attendance log document into the public API response."""
     def to_ms(value):
@@ -128,6 +172,11 @@ def attendance_out(doc: dict) -> dict:
         "half_day": bool(doc.get("half_day", False)),
         "history": doc.get("history", []) or [],
     }
+
+
+def record_out(doc: dict) -> dict:
+    """Alias for attendance_out for backwards compatibility."""
+    return attendance_out(doc)
 
 
 def employee_out(doc: dict) -> dict:
@@ -163,6 +212,25 @@ def current_month() -> str:
     return datetime.now(IST).strftime("%Y-%m")
 
 
+def ensure_month(value: str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        year_text, month_text = value.split("-")
+        parsed = date(int(year_text), int(month_text), 1)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=422,
+            detail="month must use YYYY-MM format",
+        )
+    if parsed.strftime("%Y-%m") != value:
+        raise HTTPException(
+            status_code=422,
+            detail="month must use YYYY-MM format",
+        )
+    return value
+
+
 def ensure_date(value: str | None, field_name: str) -> str | None:
     if value is None:
         return None
@@ -179,6 +247,48 @@ def ensure_date(value: str | None, field_name: str) -> str | None:
             detail=f"{field_name} must use YYYY-MM-DD format",
         )
     return value
+
+
+def _attendance_query(
+    emp_code: str | None,
+    date_from: str | None,
+    date_to: str | None,
+    status: str | None,
+) -> dict[str, Any]:
+    date_from = ensure_date(date_from, "date_from")
+    date_to = ensure_date(date_to, "date_to")
+
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=422,
+            detail="date_from cannot be after date_to",
+        )
+    if status is not None and status not in ALLOWED_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"status must be one of {sorted(ALLOWED_STATUSES)}",
+        )
+
+    query: dict[str, Any] = {}
+    if emp_code is not None:
+        query["emp_code"] = emp_code
+    if date_from is not None or date_to is not None:
+        query["date"] = {}
+        if date_from is not None:
+            query["date"]["$gte"] = date_from
+        if date_to is not None:
+            query["date"]["$lte"] = date_to
+    if status is not None:
+        query["status"] = status
+    return query
+
+
+def _attendance_hint(query: dict[str, Any]) -> str:
+    if "emp_code" in query:
+        return "ux_logs_emp_code_date"
+    if "status" in query:
+        return "ix_logs_status_date_emp_code"
+    return "ix_logs_date_desc_emp_code"
 
 
 def working_days_in_month(month: str, joined_on: str) -> int:
@@ -276,12 +386,18 @@ def employee_monthly_pipeline(emp_code: str, month: str) -> list[dict]:
     ]
 
 
-def department_summary_pipeline(month: str) -> list[dict]:
+def department_summary_pipeline(
+    month: str,
+    department: str | None = None,
+) -> list[dict]:
     """Aggregate monthly attendance by department, including employees with no logs."""
     first, last = month_bounds(month)
+    employee_filter: dict[str, Any] = {"joined_on": {"$lte": last}}
+    if department is not None:
+        employee_filter["department"] = department
 
     return [
-        {"$match": {"joined_on": {"$lte": last}}},
+        {"$match": employee_filter},
         {
             "$lookup": {
                 "from": "attendance_logs",
@@ -473,6 +589,7 @@ db = client[MONGO_DB]
 
 employees = db["employees"]
 attendance_logs = db["attendance_logs"]
+logs = attendance_logs
 
 
 def create_indexes():
@@ -1069,6 +1186,7 @@ def department_trend(
         "items": items,
     }
 
+
 def _leaderboard_query(
     month: Optional[str],
     date_from: Optional[str],
@@ -1150,6 +1268,7 @@ def late_leaderboard_pipeline(
     ])
     return pipeline
 
+
 @app.get("/analytics/leaderboard/late")
 def late_leaderboard(
     month: str | None = Query(
@@ -1159,7 +1278,7 @@ def late_leaderboard(
     limit: int = Query(10, ge=1, le=50),
     department: str | None = Query(default=None),
 ):
-    selected_month = month or datetime.now(IST).strftime("%Y-%m")
+    selected_month = month or current_month()
     query = _leaderboard_query(selected_month, None, None)
     rows = attendance_logs.aggregate(
         late_leaderboard_pipeline(limit, query, department),
@@ -1181,6 +1300,7 @@ def late_leaderboard(
             for row in rows
         ],
     }
+
 
 
 @app.patch("/attendance/{emp_code}/{date}")
@@ -1393,17 +1513,9 @@ def department_summary(
     month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
     department: str | None = Query(default=None),
 ):
-    _, last = month_bounds(month)
-    employee_filter = {"joined_on": {"$lte": last}}
-    if department is not None:
-        employee_filter["department"] = department
-
     items = []
     results = employees.aggregate(
-        [
-            {"$match": employee_filter},
-            *department_summary_pipeline(month)[1:],
-        ],
+        department_summary_pipeline(month, department),
         hint="ix_employees_joined_on",
         allowDiskUse=True,
     )
@@ -1441,46 +1553,8 @@ def list_attendance(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ):
-    ALLOWED_STATUSES = {"PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"}
-
-    # Validate any date strings before touching the database
-    for value, field_name in ((date_from, "date_from"), (date_to, "date_to")):
-        if value is not None:
-            try:
-                parsed = date.fromisoformat(value)
-            except ValueError:
-                raise HTTPException(status_code=422, detail=f"{field_name} must use YYYY-MM-DD format")
-            if parsed.isoformat() != value:
-                raise HTTPException(status_code=422, detail=f"{field_name} must use YYYY-MM-DD format")
-
-    if status is not None and status not in ALLOWED_STATUSES:
-        raise HTTPException(status_code=422, detail=f"status must be one of {sorted(ALLOWED_STATUSES)}")
-
-    if date_from and date_to and date_from > date_to:
-        raise HTTPException(status_code=422, detail="date_from cannot be after date_to")
-
-    query = {}
-
-    if emp_code is not None:
-        query["emp_code"] = emp_code
-
-    if date_from is not None or date_to is not None:
-        query["date"] = {}
-        if date_from is not None:
-            query["date"]["$gte"] = date_from
-        if date_to is not None:
-            query["date"]["$lte"] = date_to
-
-    if status is not None:
-        query["status"] = status
-
-    # Choose the most selective index based on what filters are active
-    if emp_code is not None:
-        index_hint = "ux_logs_emp_code_date"
-    elif status is not None:
-        index_hint = "ix_logs_status_date_emp_code"
-    else:
-        index_hint = "ix_logs_date_desc_emp_code"
+    query = _attendance_query(emp_code, date_from, date_to, status)
+    index_hint = _attendance_hint(query)
 
     total = attendance_logs.count_documents(query, hint=index_hint)
 
@@ -1498,3 +1572,151 @@ def list_attendance(
         "page": page,
         "page_size": page_size,
     }
+
+
+
+@app.get("/admin/explain/{endpoint}")
+def admin_explain(
+    endpoint: Literal[
+        "attendance_list",
+        "employee_monthly",
+        "department_summary",
+        "late_leaderboard",
+        "department_trend",
+    ],
+    emp_code: Optional[str] = Query(None),
+    department: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    month: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    limit: int = Query(10, ge=1),
+    window: int = Query(7, ge=1),
+):
+    df = ensure_date(date_from, "date_from")
+    dt = ensure_date(date_to, "date_to")
+    selected_month = ensure_month(month)
+
+    if df and dt and df > dt:
+        raise HTTPException(
+            status_code=422,
+            detail="date_from must be on or before date_to",
+        )
+
+    if endpoint == "attendance_list":
+        query = _attendance_query(emp_code, df, dt, status)
+        command = {
+            "find": "attendance_logs",
+            "filter": query,
+            "sort": {"date": -1, "emp_code": 1},
+            "skip": (page - 1) * page_size,
+            "limit": page_size,
+            "hint": _attendance_hint(query),
+        }
+
+    elif endpoint == "employee_monthly":
+        if emp_code is None:
+            raise HTTPException(
+                status_code=422,
+                detail="emp_code is required for employee_monthly",
+            )
+        if selected_month is None:
+            raise HTTPException(
+                status_code=422,
+                detail="month is required for employee_monthly",
+            )
+        command = {
+            "aggregate": "attendance_logs",
+            "pipeline": employee_monthly_pipeline(
+                emp_code,
+                selected_month,
+            ),
+            "cursor": {},
+            "hint": "ux_logs_emp_code_date",
+        }
+
+    elif endpoint == "department_summary":
+        if selected_month is None:
+            raise HTTPException(
+                status_code=422,
+                detail="month is required for department_summary",
+            )
+        command = {
+            "aggregate": "employees",
+            "pipeline": department_summary_pipeline(
+                selected_month,
+                department,
+            ),
+            "cursor": {},
+            "hint": "ix_employees_joined_on",
+        }
+
+    elif endpoint == "late_leaderboard":
+        query = _leaderboard_query(selected_month, df, dt)
+        command = {
+            "aggregate": "attendance_logs",
+            "pipeline": late_leaderboard_pipeline(limit, query),
+            "cursor": {},
+            "hint": _leaderboard_hint(query),
+        }
+
+    else:  # department_trend
+        default_from, default_to = _default_range()
+        trend_from = df or default_from
+        trend_to = dt or default_to
+
+        if trend_from > trend_to:
+            raise HTTPException(
+                status_code=422,
+                detail="date_from must be on or before date_to",
+            )
+
+        if not department:
+            raise HTTPException(
+                status_code=422,
+                detail="department is required for department_trend",
+            )
+
+        seed = employees.find_one(
+            {"department": department},
+            {"_id": 1},
+        )
+
+        if seed is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Unknown department: {department}",
+            )
+
+        command = {
+            "aggregate": "employees",
+            "pipeline": department_trend_pipeline(
+                department,
+                trend_from,
+                trend_to,
+                window,
+                seed["_id"],
+            ),
+            "cursor": {},
+            "hint": "ix_employees_department_emp_code",
+        }
+
+    try:
+        result = db.command(
+            "explain",
+            command,
+            verbosity="executionStats",
+        )
+        response = {
+            "endpoint": endpoint,
+            "collection": command.get("aggregate") or command.get("find"),
+            "explain": result,
+        }
+        return json.loads(json_util.dumps(response))
+    except PyMongoError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to run MongoDB explain",
+        ) from exc
