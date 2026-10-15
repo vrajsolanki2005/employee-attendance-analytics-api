@@ -1,6 +1,8 @@
+import calendar
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
@@ -148,6 +150,108 @@ def employee_out(doc: dict) -> dict:
         "joined_on": doc["joined_on"],
         "created_at": created_at_ms,
     }
+
+
+def month_bounds(month: str) -> tuple[str, str]:
+    year, month_number = map(int, month.split("-"))
+    first = date(year, month_number, 1)
+    last = date(year, month_number, calendar.monthrange(year, month_number)[1])
+    return first.isoformat(), last.isoformat()
+
+
+def working_days_in_month(month: str, joined_on: str) -> int:
+    first_str, last_str = month_bounds(month)
+    first = max(date.fromisoformat(first_str), date.fromisoformat(joined_on))
+    last = date.fromisoformat(last_str)
+    if first > last:
+        return 0
+    return sum(
+        (first + timedelta(days=offset)).weekday() < 5
+        for offset in range((last - first).days + 1)
+    )
+
+
+def round_half_up(value: int | float | Decimal, places: int) -> float:
+    quantum = Decimal(1).scaleb(-places)
+    return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP))
+
+
+def _weekday_of(date_str_expr):
+    return {
+        "$dayOfWeek": {
+            "$dateFromString": {
+                "dateString": date_str_expr,
+                "format": "%Y-%m-%d",
+            }
+        }
+    }
+
+
+def _is_weekday(date_str_expr):
+    # MongoDB: Sunday=1, Monday=2, ..., Friday=6, Saturday=7
+    return {"$in": [_weekday_of(date_str_expr), [2, 3, 4, 5, 6]]}
+
+
+def employee_monthly_pipeline(emp_code: str, month: str) -> list[dict]:
+    first, last = month_bounds(month)
+
+    return [
+        {
+            "$match": {
+                "emp_code": emp_code,
+                "date": {"$gte": first, "$lte": last},
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
+                                    _is_weekday("$date"),
+                                ]
+                            },
+                            {
+                                "$cond": [
+                                    {"$eq": [{"$ifNull": ["$half_day", False]}, True]},
+                                    0.5,
+                                    1,
+                                ]
+                            },
+                            0,
+                        ]
+                    }
+                },
+                "leave_days": {
+                    "$sum": {
+                        "$cond": [
+                            {"$eq": ["$status", "LEAVE"]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "total_late_minutes": {
+                    "$sum": {"$ifNull": ["$late_minutes", 0]}
+                },
+                "total_overtime_minutes": {
+                    "$sum": {"$ifNull": ["$overtime_minutes", 0]}
+                },
+            }
+        },
+    ]
 
 
 # Database setup
@@ -310,6 +414,57 @@ app = FastAPI(
 # Routes
 
 
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(
+    emp_code: str,
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+):
+    employee = employees.find_one(
+        {"emp_code": emp_code},
+        {"_id": 0, "joined_on": 1},
+    )
+    if employee is None:
+        raise HTTPException(404, f"unknown emp_code: {emp_code}")
+
+    row = next(
+        attendance_logs.aggregate(
+            employee_monthly_pipeline(emp_code, month),
+            hint="ux_logs_emp_code_date",
+        ),
+        None,
+    )
+
+    # An employee may have no attendance records during this month.
+    if row is None:
+        row = {
+            "present_days": 0,
+            "leave_days": 0,
+            "late_count": 0,
+            "total_late_minutes": 0,
+            "total_overtime_minutes": 0,
+        }
+
+    working_days = working_days_in_month(month, employee["joined_on"])
+    present_days = round_half_up(row["present_days"], 2)
+    attendance_pct = (
+        round_half_up(Decimal(str(present_days)) * 100 / working_days, 4)
+        if working_days
+        else None
+    )
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": int(row["leave_days"]),
+        "late_count": int(row["late_count"]),
+        "total_late_minutes": int(row["total_late_minutes"]),
+        "total_overtime_minutes": int(row["total_overtime_minutes"]),
+        "attendance_pct": attendance_pct,
+    }
+
+
 @app.get("/")
 def root():
     return {"message": "Employee Attendance API is running"}
@@ -424,6 +579,132 @@ def punch_out(body: PunchOutIn):
         )
 
     return attendance_out(updated)
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def patch_attendance(emp_code: str, date: str, body: AttendancePatch):
+    day = ensure_date(date, "date")
+
+    emp = employees.find_one(
+        {"emp_code": emp_code},
+        {"_id": 0, "shift_start": 1, "shift_end": 1},
+    )
+    if emp is None:
+        raise HTTPException(404, f"unknown emp_code: {emp_code}")
+
+    shift_start = emp.get("shift_start") or "09:30"
+    shift_end = emp.get("shift_end") or "18:30"
+
+    # Retry optimistic updates if another request modifies the record.
+    for _ in range(6):
+        doc = logs.find_one({"emp_code": emp_code, "date": day})
+        if doc is None:
+            raise HTTPException(
+                404, f"no attendance record for {emp_code} on {day}"
+            )
+
+        old = {
+            "status": doc.get("status"),
+            "punch_in": doc.get("punch_in"),
+            "punch_out": doc.get("punch_out"),
+            "work_hours": doc.get("work_hours"),
+            "late_minutes": doc.get("late_minutes") or 0,
+            "overtime_minutes": doc.get("overtime_minutes") or 0,
+            "half_day": bool(doc.get("half_day", False)),
+        }
+
+        new_status = body.status if body.status is not None else old["status"]
+
+        if new_status in ("ABSENT", "LEAVE"):
+            if body.punch_in is not None or body.punch_out is not None:
+                raise HTTPException(
+                    422, "ABSENT/LEAVE records cannot carry punch times"
+                )
+            new_punch_in = None
+            new_punch_out = None
+        else:
+            new_punch_in = (
+                ms_to_utc_naive(trunc_ms(body.punch_in))
+                if body.punch_in is not None
+                else old["punch_in"]
+            )
+            new_punch_out = (
+                ms_to_utc_naive(trunc_ms(body.punch_out))
+                if body.punch_out is not None
+                else old["punch_out"]
+            )
+
+        if new_punch_in is None and new_punch_out is not None:
+            raise HTTPException(422, "punch_out cannot be set without punch_in")
+
+        if new_punch_in is not None and new_punch_out is not None:
+            in_ist = utc_naive_to_ist(new_punch_in)
+            out_ist = utc_naive_to_ist(new_punch_out)
+
+            if out_ist < in_ist:
+                raise HTTPException(422, "punch_out is before punch_in")
+
+            work_hours = compute_work_hours(in_ist, out_ist)
+            overtime = compute_overtime_minutes(
+                out_ist, day, shift_start, shift_end
+            )
+            half_day = work_hours < HALF_DAY_THRESHOLD
+        else:
+            work_hours = None
+            overtime = 0
+            half_day = False
+
+        late = (
+            compute_late_minutes(
+                utc_naive_to_ist(new_punch_in), day, shift_start
+            )
+            if new_punch_in is not None
+            else 0
+        )
+
+        new = {
+            "status": new_status,
+            "punch_in": new_punch_in,
+            "punch_out": new_punch_out,
+            "work_hours": work_hours,
+            "late_minutes": late,
+            "overtime_minutes": overtime,
+            "half_day": half_day,
+        }
+
+        changes = {
+            field: {"from": old[field], "to": new[field]}
+            for field in old
+            if old[field] != new[field]
+        }
+
+        history_entry = {
+            "at": now_utc_naive(),
+            "by": body.corrected_by,
+            "reason": body.reason,
+            "changes": changes,
+        }
+
+        result = logs.update_one(
+            {
+                "_id": doc["_id"],
+                "status": old["status"],
+                "punch_in": old["punch_in"],
+                "punch_out": old["punch_out"],
+            },
+            {
+                "$set": new,
+                "$push": {"history": history_entry},
+            },
+        )
+
+        if result.matched_count == 1:
+            updated = logs.find_one({"_id": doc["_id"]})
+            return record_out(updated)
+
+    raise HTTPException(
+        409, "concurrent modification; please retry"
+    )
 
 
 @app.get("/employees")
