@@ -20,9 +20,7 @@ GRACE_SECONDS = 600
 MS_MIN, MS_MAX = 10**11, 10**14
 
 
-# ---------------------------------------------------------------------------
 # Time helpers
-# ---------------------------------------------------------------------------
 
 def trunc_ms(ms: int) -> int:
     """Drop sub-second precision so punch times are always whole seconds."""
@@ -58,9 +56,7 @@ def utc_naive_to_ist(dt: datetime) -> datetime:
     return dt.replace(tzinfo=timezone.utc).astimezone(IST)
 
 
-# ---------------------------------------------------------------------------
 # Shift / attendance-date helpers
-# ---------------------------------------------------------------------------
 
 def _hhmm(value: str) -> tuple[int, int]:
     hour, minute = value.split(":")
@@ -112,9 +108,6 @@ def compute_late_minutes(punch_ist: datetime, attendance_date: str, shift_start:
     return int(elapsed_seconds // 60)
 
 
-# ---------------------------------------------------------------------------
-# Response serialisers
-# ---------------------------------------------------------------------------
 
 def attendance_out(doc: dict) -> dict:
     """Shape an attendance log document into the public API response."""
@@ -157,10 +150,7 @@ def employee_out(doc: dict) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
 # Database setup
-# ---------------------------------------------------------------------------
-
 load_dotenv(override=False)
 
 MONGO_URI = os.getenv("MONGO_URI")
@@ -217,9 +207,7 @@ def create_indexes():
     )
 
 
-# ---------------------------------------------------------------------------
 # Request models
-# ---------------------------------------------------------------------------
 
 class EmployeeIn(BaseModel):
 
@@ -266,9 +254,20 @@ class PunchInIn(BaseModel):
         return value
 
 
-# ---------------------------------------------------------------------------
+class PunchOutIn(BaseModel):
+    emp_code: str = Field(min_length=1, max_length=64)
+    punched_at: StrictInt | None = None
+
+    @field_validator("punched_at")
+    @classmethod
+    def validate_timestamp(cls, value):
+        if value is not None and not (10**11 <= value <= 10**14):
+            raise ValueError("punched_at must be epoch milliseconds")
+        return value
+
+
 # App bootstrap
-# ---------------------------------------------------------------------------
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -288,9 +287,8 @@ app = FastAPI(
 )
 
 
-# ---------------------------------------------------------------------------
 # Routes
-# ---------------------------------------------------------------------------
+
 
 @app.get("/")
 def root():
@@ -317,6 +315,95 @@ def create_employee(body: EmployeeIn):
         raise HTTPException(status_code=409, detail=f"emp_code already exists: {body.emp_code}")
 
     return employee_out(employee)
+
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    employee = employees.find_one(
+        {"emp_code": body.emp_code},
+        {"_id": 0, "shift_start": 1, "shift_end": 1},
+    )
+
+    if employee is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    shift_start = employee.get("shift_start") or "09:30"
+    shift_end = employee.get("shift_end") or "18:30"
+
+    timestamp_ms = (
+        trunc_ms(body.punched_at)
+        if body.punched_at is not None
+        else now_ms()
+    )
+
+    punch_out_ist = ms_to_ist(timestamp_ms)
+    punch_out_utc = ms_to_utc_naive(timestamp_ms)
+
+    # Find today's attendance record using the punch-in-derived date.
+    punch_in_record = attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_out": None}
+    )
+
+    if punch_in_record is None:
+        existing = attendance_logs.find_one(
+            {"emp_code": body.emp_code},
+            sort=[("date", -1)],
+        )
+
+        if existing is None:
+            raise HTTPException(
+                status_code=404,
+                detail="No attendance record found",
+            )
+
+        raise HTTPException(
+            status_code=409,
+            detail="Attendance record already punched out",
+        )
+
+    record_date = punch_in_record["date"]
+    punch_in_ist = utc_naive_to_ist(punch_in_record["punch_in"])
+
+    if timestamp_ms < utc_naive_to_ms(punch_in_record["punch_in"]):
+        raise HTTPException(
+            status_code=422,
+            detail="Punch-out cannot be earlier than punch-in",
+        )
+
+    work_hours = compute_work_hours(punch_in_ist, punch_out_ist)
+    overtime_minutes = compute_overtime_minutes(
+        punch_out_ist,
+        record_date,
+        shift_start,
+        shift_end,
+    )
+    half_day = work_hours < 4.50
+
+    # Atomic compare-and-set: only one concurrent request can change null
+    # punch_out to a timestamp.
+    updated = attendance_logs.find_one_and_update(
+        {
+            "_id": punch_in_record["_id"],
+            "punch_out": None,
+        },
+        {
+            "$set": {
+                "punch_out": punch_out_utc,
+                "work_hours": work_hours,
+                "overtime_minutes": overtime_minutes,
+                "half_day": half_day,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if updated is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Attendance record already punched out",
+        )
+
+    return attendance_out(updated)
 
 
 @app.get("/employees")
