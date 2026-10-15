@@ -1,12 +1,12 @@
-"""Loads the nine sample documents from sample_data/ (see DATA_MODEL.md) into your database.
+"""Loads the sample employee and attendance documents from sample_data/ into your database.
 Usage:  python sample_seed.py            (reads MONGO_URI / MONGO_DB from the environment or .env)
 
 Equivalent with the MongoDB tools:
   mongoimport --uri "$MONGO_URI" --db "$MONGO_DB" -c employees       --jsonArray --drop --file sample_data/employees.json
   mongoimport --uri "$MONGO_URI" --db "$MONGO_DB" -c attendance_logs --jsonArray --drop --file sample_data/attendance_logs.json
 
-The samples show document SHAPES only. The grader uses a much larger hidden dataset with cases they do not show.
-Passing on this sample does not mean your analytics are correct - re-read the business rules."""
+The October 2026 attendance entries exercise monthly analytics. The grader uses a much larger hidden dataset with cases
+they do not show. Passing on this sample does not mean your analytics are correct - re-read the business rules."""
 import os
 import pathlib
 

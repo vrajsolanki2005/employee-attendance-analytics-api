@@ -159,6 +159,28 @@ def month_bounds(month: str) -> tuple[str, str]:
     return first.isoformat(), last.isoformat()
 
 
+def current_month() -> str:
+    return datetime.now(IST).strftime("%Y-%m")
+
+
+def ensure_date(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field_name} must use YYYY-MM-DD format",
+        )
+    if parsed.isoformat() != value:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field_name} must use YYYY-MM-DD format",
+        )
+    return value
+
+
 def working_days_in_month(month: str, joined_on: str) -> int:
     first_str, last_str = month_bounds(month)
     first = max(date.fromisoformat(first_str), date.fromisoformat(joined_on))
@@ -764,6 +786,289 @@ def punch_out(body: PunchOutIn):
     return attendance_out(updated)
 
 
+
+def department_trend_pipeline(
+    department: str,
+    date_from: str,
+    date_to: str,
+    window: int,
+    seed_id: Any,
+) -> list[dict]:
+    num_days = (
+        date.fromisoformat(date_to) - date.fromisoformat(date_from)
+    ).days + 1
+    start_dt = datetime.fromisoformat(date_from)
+
+    return [
+        {"$match": {"department": department}},
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "localField": "emp_code",
+                "foreignField": "emp_code",
+                "pipeline": [
+                    {
+                        "$match": {
+                            "date": {"$gte": date_from, "$lte": date_to}
+                        }
+                    },
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "date": 1,
+                            "status": 1,
+                            "half_day": 1,
+                            "late_minutes": 1,
+                        }
+                    },
+                ],
+                "as": "logs",
+            }
+        },
+        {"$unwind": {"path": "$logs", "preserveNullAndEmptyArrays": True}},
+        {"$match": {"logs.date": {"$exists": True}}},
+        {
+            "$group": {
+                "_id": "$logs.date",
+                "present_count": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$in": [
+                                    "$logs.status",
+                                    ["PRESENT", "WFH", "ON_DUTY"],
+                                ]
+                            },
+                            {
+                                "$cond": [
+                                    {"$eq": [{"$ifNull": ["$logs.half_day", False]}, True]},
+                                    0.5,
+                                    1,
+                                ]
+                            },
+                            0,
+                        ]
+                    }
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$gt": [{"$ifNull": ["$logs.late_minutes", 0]}, 0]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "date": "$_id",
+                "present_count": 1,
+                "late_count": 1,
+            }
+        },
+        {
+            "$unionWith": {
+                "coll": "employees",
+                "pipeline": [
+                    {"$match": {"_id": seed_id}},
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "dates": {
+                                "$map": {
+                                    "input": {"$range": [0, num_days]},
+                                    "as": "i",
+                                    "in": {
+                                        "$dateToString": {
+                                            "format": "%Y-%m-%d",
+                                            "date": {
+                                                "$dateAdd": {
+                                                    "startDate": start_dt,
+                                                    "unit": "day",
+                                                    "amount": "$$i",
+                                                }
+                                            },
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    },
+                    {"$unwind": "$dates"},
+                    {
+                        "$project": {
+                            "date": "$dates",
+                            "present_count": {"$literal": 0},
+                            "late_count": {"$literal": 0},
+                        }
+                    },
+                ],
+            }
+        },
+        {
+            "$group": {
+                "_id": "$date",
+                "present_count": {"$max": "$present_count"},
+                "late_count": {"$max": "$late_count"},
+            }
+        },
+        {"$sort": {"_id": 1}},
+        {
+            "$lookup": {
+                "from": "employees",
+                "let": {"trend_date": "$_id"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$department", department]},
+                                    {"$lte": ["$joined_on", "$$trend_date"]},
+                                ]
+                            }
+                        }
+                    },
+                    {"$count": "headcount"},
+                ],
+                "as": "active_employees",
+            }
+        },
+        {
+            "$addFields": {
+                "is_working_day": {
+                    "$in": [
+                        {
+                            "$dayOfWeek": {
+                                "$dateFromString": {
+                                    "dateString": "$_id",
+                                    "format": "%Y-%m-%d",
+                                }
+                            }
+                        },
+                        [2, 3, 4, 5, 6],
+                    ]
+                },
+                "headcount": {
+                    "$ifNull": [
+                        {"$arrayElemAt": ["$active_employees.headcount", 0]},
+                        0,
+                    ]
+                },
+            }
+        },
+        {
+            "$addFields": {
+                "attendance_rate": {
+                    "$cond": [
+                        {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+                        {"$divide": ["$present_count", "$headcount"]},
+                        None,
+                    ]
+                }
+            }
+        },
+        {
+            "$setWindowFields": {
+                "sortBy": {"_id": 1},
+                "output": {
+                    "moving_avg_7d": {
+                        "$avg": "$attendance_rate",
+                        "window": {"documents": [-window + 1, 0]},
+                    },
+                },
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "date": "$_id",
+                "is_working_day": 1,
+                "headcount": 1,
+                "present_count": 1,
+                "late_count": 1,
+                "attendance_rate": 1,
+                "moving_avg_7d": 1,
+            }
+        },
+    ]
+
+
+def _default_range() -> tuple[str, str]:
+    return month_bounds(current_month())
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    date_from: Optional[str] = Query(None, alias="from"),
+    date_to: Optional[str] = Query(None, alias="to"),
+    window: int = Query(7, ge=1, le=92),
+):
+    default_from, default_to = _default_range()
+    start_date = ensure_date(date_from, "date_from") or default_from
+    end_date = ensure_date(date_to, "date_to") or default_to
+
+    if start_date > end_date:
+        raise HTTPException(
+            status_code=422,
+            detail="date_from must be on or before date_to",
+        )
+    if (date.fromisoformat(end_date) - date.fromisoformat(start_date)).days + 1 > 92:
+        raise HTTPException(
+            status_code=422,
+            detail="date range cannot exceed 92 days",
+        )
+
+    seed = employees.find_one(
+        {"department": department},
+        {"_id": 1},
+    )
+    if seed is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Unknown department: {department}",
+        )
+
+    rows = employees.aggregate(
+        department_trend_pipeline(
+            department,
+            start_date,
+            end_date,
+            window,
+            seed["_id"],
+        ),
+        hint="ix_employees_department_emp_code",
+        allowDiskUse=True,
+    )
+
+    items = []
+    for row in rows:
+        items.append({
+            "date": row["date"],
+            "is_working_day": row["is_working_day"],
+            "headcount": int(row["headcount"]),
+            "present_count": round_half_up(row["present_count"], 2),
+            "late_count": int(row["late_count"]),
+            "attendance_rate": (
+                round_half_up(row["attendance_rate"], 4)
+                if row["attendance_rate"] is not None
+                else None
+            ),
+            "moving_avg_7d": (
+                round_half_up(row["moving_avg_7d"], 4)
+                if row["moving_avg_7d"] is not None
+                else None
+            ),
+        })
+
+    return {
+        "department": department,
+        "items": items,
+    }
+
 def _leaderboard_query(
     month: Optional[str],
     date_from: Optional[str],
@@ -823,12 +1128,12 @@ def late_leaderboard_pipeline(
                 "late_count": {"$sum": 1},
             }
         },
-        # Competition ranking: 1, 2, 2, 4.
-        {"$setWindowFields": {
-            "sortBy": {"total_late_minutes": -1},
-            "output": {"rank": {"$rank": {}}},
-        }},
-        # Apply the limit after ranking, retaining employees tied at the cutoff.
+        {
+            "$setWindowFields": {
+                "sortBy": {"total_late_minutes": -1},
+                "output": {"rank": {"$rank": {}}},
+            }
+        },
         {"$match": {"rank": {"$lte": limit}}},
         {
             "$project": {
@@ -845,14 +1150,17 @@ def late_leaderboard_pipeline(
     ])
     return pipeline
 
-
 @app.get("/analytics/leaderboard/late")
 def late_leaderboard(
-    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    month: str | None = Query(
+        default=None,
+        pattern=r"^\d{4}-(0[1-9]|1[0-2])$",
+    ),
     limit: int = Query(10, ge=1, le=50),
     department: str | None = Query(default=None),
 ):
-    query = _leaderboard_query(month, None, None)
+    selected_month = month or datetime.now(IST).strftime("%Y-%m")
+    query = _leaderboard_query(selected_month, None, None)
     rows = attendance_logs.aggregate(
         late_leaderboard_pipeline(limit, query, department),
         hint=_leaderboard_hint(query),
@@ -860,7 +1168,7 @@ def late_leaderboard(
     )
 
     return {
-        "month": month,
+        "month": selected_month,
         "items": [
             {
                 "name": row["name"],
