@@ -1,13 +1,13 @@
 import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
-from typing import Literal
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.errors import DuplicateKeyError, PyMongoError
-from pydantic import BaseModel, Field, StrictInt, field_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator, AliasChoices
 
 # IST is UTC+5:30 — all attendance dates are resolved in this timezone
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -265,6 +265,26 @@ class PunchOutIn(BaseModel):
             raise ValueError("punched_at must be epoch milliseconds")
         return value
 
+
+class AttendancePatch(BaseModel):
+    status: Optional[
+        Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]
+    ] = None
+
+    punch_in: Optional[StrictInt] = None
+    punch_out: Optional[StrictInt] = None
+
+    reason: str = Field(min_length=1, max_length=1000)
+    corrected_by: str = Field(
+        min_length=1,
+        max_length=200,
+        validation_alias=AliasChoices("corrected_by", "by"),
+    )
+
+    @field_validator("punch_in", "punch_out")
+    @classmethod
+    def validate_timestamp(cls, value):
+        return _epoch_ms(value)
 
 # App bootstrap
 
